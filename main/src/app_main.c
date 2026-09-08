@@ -8,8 +8,10 @@
 #include <esp_log.h>
 #include <esp_check.h>
 
+#include "app_events.h"
 #include "ble_client.h"
 #include "config.h"
+#include "pushbutton.h"
 #include "river2_auth.h"
 #include "river2_telemetry.h"
 
@@ -98,6 +100,15 @@ void app_main(void)
     }
     ESP_LOGI(__func__, "Lookup table MD5: %s", md5_str);
 
+    r = gpio_install_isr_service(0);
+    ESP_RETURN_VOID_ON_ERROR(r, __func__, "gpio_install_isr_service() failed");
+
+    pushbutton_t toggle_ac_btn, toggle_dc_btn;
+    r = pushbutton_init(GPIO_NUM_36, TOGGLE_AC_PORT_EVT, &toggle_ac_btn);
+    ESP_RETURN_VOID_ON_ERROR(r, __func__, "pushbutton_init() failed for pin 36");
+    r = pushbutton_init(GPIO_NUM_37, TOGGLE_DC_PORT_EVT, &toggle_dc_btn);
+    ESP_RETURN_VOID_ON_ERROR(r, __func__, "pushbutton_init() failed for pin 37");
+
     r = river2_ble_init();
     ESP_RETURN_VOID_ON_ERROR(r, __func__, "river2_ble_init() failed");
 
@@ -113,6 +124,12 @@ void app_main(void)
         xTaskNotifyWait(0, UINT32_MAX, &bits, portMAX_DELAY);
         if (bits & RIVER2_TELEMETRY_EVT_BATTERY_LEVEL) {
             ESP_LOGI(__func__, "Battery level: %d%%", river2_telemetry_battery_percent());
+        }
+        if (bits & TOGGLE_AC_PORT_EVT) {
+            ESP_LOGI(__func__, "Toggle AC port");
+        }
+        if (bits & TOGGLE_DC_PORT_EVT) {
+            ESP_LOGI(__func__, "Toggle DC port");
         }
     }
 }

@@ -4,13 +4,8 @@
 #include <freertos/task.h>
 #include <esp_err.h>
 
+#include "app_events.h" /* RIVER2_TELEMETRY_EVT_BATTERY_LEVEL */
 #include "river2_auth.h"
-
-/* Battery-level event, delivered as a bit on the owner task's own task
- * notification. Shares that notification word with BLE_EVT_* (ble_client.h
- * uses bits 0-3), so this module uses bit 4. Read the value with
- * river2_telemetry_battery_percent(). */
-#define RIVER2_TELEMETRY_EVT_BATTERY_LEVEL (1u << 4)
 
 /* Starts a background task that reads BLE notifications, decrypts and
  * decodes PD heartbeats (protocol doc §5.1) under `session`, and notifies

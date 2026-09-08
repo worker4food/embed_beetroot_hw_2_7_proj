@@ -4,14 +4,7 @@
 #include <stdint.h>
 #include <esp_err.h>
 
-/* BLE lifecycle events, delivered as bits on the owner task's own task
- * notification (xTaskNotify(..., eSetBits)) rather than a separate event
- * group, since only one task ever owns/waits on them. Drain with
- * xTaskNotifyWait(0, UINT32_MAX, &bits, ...). */
-#define BLE_EVT_HOST_SYNC     (1u << 0)
-#define BLE_EVT_CONNECTED     (1u << 1)
-#define BLE_EVT_CONNECT_ERROR (1u << 2)
-#define BLE_EVT_DISCONNECTED  (1u << 3)
+#include "app_events.h" /* BLE_EVT_* */
 
 /* Brings up the NimBLE host. Non-blocking: the calling task becomes the
  * owner task and is notified with BLE_EVT_HOST_SYNC once synced. Call once,

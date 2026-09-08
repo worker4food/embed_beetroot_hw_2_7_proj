@@ -336,7 +336,7 @@ esp_err_t river2_ble_init(void)
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
-    ble_svc_gap_device_name_set("river2pro-bridge");
+    ble_svc_gap_device_name_set("beetroot_2_7_project");
 
     nimble_port_freertos_init(host_task);
 
