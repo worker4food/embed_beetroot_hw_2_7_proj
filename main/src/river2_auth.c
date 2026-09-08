@@ -13,7 +13,6 @@
 #include "river2_packet.h"
 
 #define STEP_TIMEOUT_MS 20000
-#define NOTIFY_CHUNK_MAX 512
 
 static void ensure_psa_crypto_init(void)
 {
@@ -159,7 +158,7 @@ static esp_err_t wait_for_frame(river2_framebuf_t *fb, uint8_t want_frame_type,
             return ESP_ERR_TIMEOUT;
         }
 
-        uint8_t chunk[NOTIFY_CHUNK_MAX];
+        uint8_t chunk[RIVER2_BLE_NOTIFY_CHUNK_MAX];
         size_t chunk_len = 0;
         uint32_t remaining_ms = (uint32_t)(remaining_us / 1000) + 1;
         esp_err_t err = river2_ble_wait_notification(chunk, sizeof(chunk), &chunk_len, remaining_ms);

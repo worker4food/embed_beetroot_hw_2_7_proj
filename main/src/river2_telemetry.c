@@ -7,7 +7,6 @@
 #include "river2_telemetry.h"
 
 #define TELEMETRY_STACK_SIZE 4096
-#define NOTIFY_CHUNK_MAX 512
 #define POLL_TIMEOUT_MS 5000
 
 /* PD heartbeat field 6 `soc` (protocol doc §5.1), offset by the preceding
@@ -20,13 +19,13 @@
 
 typedef struct {
     river2_session_t session;
-    TaskHandle_t owner_task;
+    EventGroupHandle_t events;
     uint32_t interval_ms;
 } telemetry_ctx_t;
 
-static volatile int8_t s_battery_percent = -1;
-static volatile int8_t s_dc_out_state = -1;
-static volatile int8_t s_ac_enabled = -1;
+static volatile int16_t s_battery_percent = -1;
+static volatile river2_port_state_t s_dc_out_state = RIVER2_PORT_UNKNOWN;
+static volatile river2_port_state_t s_ac_enabled = RIVER2_PORT_UNKNOWN;
 
 static void telemetry_task(void *arg)
 {
@@ -38,7 +37,7 @@ static void telemetry_task(void *arg)
     int64_t next_notify_us = 0;
 
     for (;;) {
-        uint8_t chunk[NOTIFY_CHUNK_MAX];
+        uint8_t chunk[RIVER2_BLE_NOTIFY_CHUNK_MAX];
         size_t chunk_len = 0;
         esp_err_t err = river2_ble_wait_notification(chunk, sizeof(chunk), &chunk_len, POLL_TIMEOUT_MS);
         if (err != ESP_OK || !river2_framebuf_append(&fb, chunk, chunk_len)) {
@@ -73,23 +72,25 @@ static void telemetry_task(void *arg)
             uint32_t notify_bits = 0;
             if (pkt.src == RIVER2_ADDR_PD && pkt.cmd_set == RIVER2_CMDSET_HEARTBEAT) {
                 if (pkt.payload_len > PD_SOC_OFFSET) {
-                    s_battery_percent = (int8_t)pkt.payload[PD_SOC_OFFSET];
+                    s_battery_percent = pkt.payload[PD_SOC_OFFSET];
                     int64_t now_us = esp_timer_get_time();
                     if (now_us >= next_notify_us) {
                         notify_bits |= RIVER2_TELEMETRY_EVT_BATTERY_LEVEL;
                         next_notify_us = now_us + (int64_t)ctx->interval_ms * 1000;
                     }
                 }
-            } else if (pkt.src == RIVER2_ADDR_MPPT) {
+            } else if (pkt.src == RIVER2_ADDR_MPPT && pkt.cmd_set == RIVER2_CMDSET_HEARTBEAT) {
                 if (pkt.payload_len > MPPT_CFG_AC_ENABLED_OFFSET) {
-                    int8_t ac_enabled = (int8_t)pkt.payload[MPPT_CFG_AC_ENABLED_OFFSET];
+                    river2_port_state_t ac_enabled =
+                        pkt.payload[MPPT_CFG_AC_ENABLED_OFFSET] ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
                     if (ac_enabled != s_ac_enabled) {
                         s_ac_enabled = ac_enabled;
                         notify_bits |= RIVER2_TELEMETRY_EVT_AC_STATE;
                     }
                 }
                 if (pkt.payload_len > MPPT_CAR_STATE_OFFSET) {
-                    int8_t dc_out_state = (int8_t)pkt.payload[MPPT_CAR_STATE_OFFSET];
+                    river2_port_state_t dc_out_state =
+                        pkt.payload[MPPT_CAR_STATE_OFFSET] ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
                     if (dc_out_state != s_dc_out_state) {
                         s_dc_out_state = dc_out_state;
                         notify_bits |= RIVER2_TELEMETRY_EVT_DC_STATE;
@@ -98,13 +99,13 @@ static void telemetry_task(void *arg)
             }
 
             if (notify_bits != 0) {
-                xTaskNotify(ctx->owner_task, notify_bits, eSetBits);
+                xEventGroupSetBits(ctx->events, notify_bits);
             }
         }
     }
 }
 
-esp_err_t river2_telemetry_start(const river2_session_t *session, TaskHandle_t owner_task,
+esp_err_t river2_telemetry_start(const river2_session_t *session, EventGroupHandle_t events,
                                   uint32_t interval_ms)
 {
     telemetry_ctx_t *ctx = malloc(sizeof(*ctx));
@@ -112,7 +113,7 @@ esp_err_t river2_telemetry_start(const river2_session_t *session, TaskHandle_t o
         return ESP_ERR_NO_MEM;
     }
     ctx->session = *session;
-    ctx->owner_task = owner_task;
+    ctx->events = events;
     ctx->interval_ms = interval_ms;
 
     if (xTaskCreate(telemetry_task, "river2_telem", TELEMETRY_STACK_SIZE, ctx, tskIDLE_PRIORITY + 1,
@@ -128,12 +129,12 @@ int river2_telemetry_battery_percent(void)
     return s_battery_percent;
 }
 
-int river2_telemetry_dc_out_state(void)
+river2_port_state_t river2_telemetry_dc_out_state(void)
 {
     return s_dc_out_state;
 }
 
-int river2_telemetry_ac_enabled(void)
+river2_port_state_t river2_telemetry_ac_enabled(void)
 {
     return s_ac_enabled;
 }

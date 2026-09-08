@@ -12,26 +12,28 @@
 static IRAM_ATTR void pushbutton_isr_handler(void *arg)
 {
     pushbutton_t *btn = (pushbutton_t *)arg;
-    esp_timer_stop(btn->debounce_timer);
-    esp_timer_start_once(btn->debounce_timer, PUSHBUTTON_DEBOUNCE_US);
+    if (!esp_timer_is_active(btn->debounce_timer)) {
+        esp_timer_start_once(btn->debounce_timer, PUSHBUTTON_DEBOUNCE_US);
+    }
 }
 
 static void pushbutton_debounce_cb(void *arg)
 {
     pushbutton_t *btn = (pushbutton_t *)arg;
     if (gpio_get_level(btn->pin) == 1) {
-        xTaskNotify(btn->owner_task, btn->event_mask, eSetBits);
+        xEventGroupSetBits(btn->events, btn->event_mask);
     }
 }
 
-esp_err_t pushbutton_init(gpio_num_t pin, uint32_t event_mask, pushbutton_t *btn)
+esp_err_t pushbutton_init(gpio_num_t pin, uint32_t event_mask, EventGroupHandle_t events,
+                           pushbutton_t *btn)
 {
-    if (btn == NULL) {
+    if (btn == NULL || events == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     btn->pin = pin;
     btn->event_mask = event_mask;
-    btn->owner_task = xTaskGetCurrentTaskHandle();
+    btn->events = events;
 
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << pin,

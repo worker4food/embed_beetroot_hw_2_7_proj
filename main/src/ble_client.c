@@ -33,15 +33,13 @@ static const uint8_t NUS_NOTIFY_UUID[16] = {
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e,
 };
 
-/* One notify-data chunk, queued because a task notification's 32-bit value
- * can't carry a variable-length buffer (see ble_client.h). */
 typedef struct {
-    uint8_t *data;
     size_t len;
+    uint8_t data[RIVER2_BLE_NOTIFY_CHUNK_MAX];
 } ble_notify_chunk_t;
 
 static QueueHandle_t s_notify_queue;
-static TaskHandle_t s_owner_task;
+static EventGroupHandle_t s_events;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_write_handle;
@@ -67,7 +65,7 @@ static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static void notify_owner(uint32_t bits)
 {
-    xTaskNotify(s_owner_task, bits, eSetBits);
+    xEventGroupSetBits(s_events, bits);
 }
 
 static void finish_connect(esp_err_t result)
@@ -274,19 +272,20 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         if (len <= 0) {
             return 0;
         }
-        uint8_t *buf = malloc((size_t)len);
-        if (buf == NULL) {
+        if ((size_t)len > RIVER2_BLE_NOTIFY_CHUNK_MAX) {
+            ESP_LOGW(__func__, "BLE notify chunk of %d bytes exceeds %d, dropping", len,
+                     RIVER2_BLE_NOTIFY_CHUNK_MAX);
             return 0;
         }
+        ble_notify_chunk_t chunk = {0};
         uint16_t out_len = 0;
-        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buf, (uint16_t)len, &out_len) != 0) {
-            free(buf);
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, chunk.data, (uint16_t)sizeof(chunk.data),
+                                &out_len) != 0) {
             return 0;
         }
-        ble_notify_chunk_t chunk = {.data = buf, .len = out_len};
+        chunk.len = out_len;
         if (xQueueSend(s_notify_queue, &chunk, 0) != pdTRUE) {
             ESP_LOGW(__func__, "BLE notify queue full, dropping %u bytes", out_len);
-            free(buf);
         }
         return 0;
     }
@@ -317,9 +316,9 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
-esp_err_t river2_ble_init(void)
+esp_err_t river2_ble_init(EventGroupHandle_t events)
 {
-    s_owner_task = xTaskGetCurrentTaskHandle();
+    s_events = events;
 
     s_notify_queue = xQueueCreate(16, sizeof(ble_notify_chunk_t));
     if (s_notify_queue == NULL) {
@@ -398,6 +397,5 @@ esp_err_t river2_ble_wait_notification(uint8_t *out_buf, size_t out_cap, size_t 
     size_t copy_len = chunk.len < out_cap ? chunk.len : out_cap;
     memcpy(out_buf, chunk.data, copy_len);
     *out_len = copy_len;
-    free(chunk.data);
     return ESP_OK;
 }
