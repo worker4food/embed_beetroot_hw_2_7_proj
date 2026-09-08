@@ -5,11 +5,13 @@
 
 #define USER_ID_SIZE 20
 #define MAC_SIZE     6
+#define SERIAL_SIZE  17
 #define LUT_SIZE     65280
 
 typedef struct {
     char ef_user[USER_ID_SIZE];
     uint8_t ef_mac[MAC_SIZE];
+    char ef_serial[SERIAL_SIZE];
     uint8_t lookup_table[LUT_SIZE];
 } ecoflow_config_t;
 

@@ -10,8 +10,7 @@
  * key derivation, auth-status wake-up, and auto-authentication using
  * cfg->ef_user as the EcoFlow user id.
  *
- * `dev_serial` is the device serial number string parsed from the BLE
- * advertisement's manufacturer data (protocol doc §1).
+ * `dev_serial` is the device serial number string (cfg->ef_serial).
  *
  * Blocks until authentication succeeds, fails, or times out. Sends outbound
  * frames via river2_ble_write() and reads inbound frames via the BLE

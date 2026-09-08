@@ -14,7 +14,6 @@
 
 ecoflow_config_t cfg;
 
-#define DEVICE_SERIAL_BUF_SIZE 32
 #define BLE_CONNECT_TIMEOUT_MS 30000
 
 #define NOTIFICATION_SINK_BUF_SIZE 512
@@ -43,8 +42,7 @@ static void notification_sink_task(void *arg)
 /* cfg.ef_mac layout: [0:6]=the 6-byte device BLE address, [6:8]=unused
  * padding (the stored NVS blob is only 6 bytes; nvs_get_blob() accepts a
  * larger destination buffer, leaving the rest zeroed). Its address *type*
- * isn't stored, so the scanner matches on address bytes alone and uses the
- * discovered advertisement's own type for the connect call. */
+ * isn't stored; river2_ble_connect() assumes a public address. */
 
 void app_main(void)
 {
@@ -72,18 +70,12 @@ void app_main(void)
     r = river2_ble_init();
     ESP_RETURN_VOID_ON_ERROR(r, __func__, "river2_ble_init() failed");
 
-    char serial[DEVICE_SERIAL_BUF_SIZE];
-    uint8_t encrypt_type = 0xFF;
-    r = river2_ble_connect(cfg.ef_mac, serial, sizeof(serial), &encrypt_type, BLE_CONNECT_TIMEOUT_MS);
+    r = river2_ble_connect(cfg.ef_mac, BLE_CONNECT_TIMEOUT_MS);
     ESP_RETURN_VOID_ON_ERROR(r, __func__, "river2_ble_connect() failed");
 
-    ESP_LOGI(__func__, "Connected to device serial=%s encrypt_type=%u", serial, encrypt_type);
-    if (encrypt_type != 7) {
-        ESP_LOGE(__func__, "Unsupported encrypt_type %u (only 7 is implemented)", encrypt_type);
-        return;
-    }
+    ESP_LOGI(__func__, "Connected to device serial=%s", cfg.ef_serial);
 
-    r = river2_auth_run(&cfg, serial);
+    r = river2_auth_run(&cfg, cfg.ef_serial);
     if (r != ESP_OK) {
         ESP_LOGE(__func__, "Authentication failed: %s", esp_err_to_name(r));
         return;

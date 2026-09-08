@@ -16,22 +16,9 @@
 
 static const char *TAG = "ble_client";
 
-#define MFG_COMPANY_ID 0xB5B5
 #define MAX_SERVICES 24
 #define HOST_SYNC_TIMEOUT_MS 10000
 #define GAP_CONNECT_TIMEOUT_MS 30000
-
-/* Manufacturer-data layout, protocol doc §1 (offsets from the AD payload
- * after the 2-byte company id): [0]=proto_version [1:17]=serial [17]=status
- * [18]=product_type [22]=capability_flags (if present). */
-#define MFG_SERIAL_OFFSET 1
-#define MFG_SERIAL_LEN 16
-#define MFG_MIN_LEN_FOR_SERIAL (MFG_SERIAL_OFFSET + MFG_SERIAL_LEN)  /* proto_version + serial */
-#define MFG_CAPABILITY_FLAGS_OFFSET 22
-#define MFG_MIN_LEN_FOR_CAPABILITY_FLAGS 19 /* + status(1) + product_type(1) */
-#define MFG_DEFAULT_CAPABILITY_FLAGS 0x38   /* => encrypt_type=7, absent flags default */
-#define MFG_ENCRYPT_TYPE_MASK 0x38
-#define MFG_ENCRYPT_TYPE_SHIFT 3
 
 extern void ble_store_config_init(void);
 
@@ -78,11 +65,6 @@ static struct {
 } s_services[MAX_SERVICES];
 static int s_service_count;
 static int s_service_idx;
-
-static uint8_t s_target_addr[6];
-static char *s_out_serial;
-static size_t s_out_serial_cap;
-static uint8_t *s_out_encrypt_type;
 
 /* forward declarations: the discovery chain calls these out of file order
  * (each begin_*_discovery() kicks off the next stage's callback). */
@@ -262,75 +244,11 @@ static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
     return 0;
 }
 
-static void parse_manufacturer_data(const uint8_t *mfg_data, size_t mfg_len)
-{
-    if (mfg_len < MFG_MIN_LEN_FOR_SERIAL) {
-        return;
-    }
-
-    size_t serial_cap = s_out_serial_cap > 0 ? s_out_serial_cap - 1 : 0;
-    size_t n = MFG_SERIAL_LEN < serial_cap ? MFG_SERIAL_LEN : serial_cap;
-    memcpy(s_out_serial, &mfg_data[MFG_SERIAL_OFFSET], n);
-    s_out_serial[n] = '\0';
-    /* null-strip: trim at the first embedded NUL, if any */
-    for (size_t i = 0; i < n; i++) {
-        if (s_out_serial[i] == '\0') {
-            break;
-        }
-    }
-
-    uint8_t capability_flags = (mfg_len > MFG_MIN_LEN_FOR_CAPABILITY_FLAGS)
-                                    ? mfg_data[MFG_CAPABILITY_FLAGS_OFFSET]
-                                    : MFG_DEFAULT_CAPABILITY_FLAGS;
-    *s_out_encrypt_type = (capability_flags & MFG_ENCRYPT_TYPE_MASK) >> MFG_ENCRYPT_TYPE_SHIFT;
-}
-
 static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
 
     switch (event->type) {
-    case BLE_GAP_EVENT_DISC: {
-        /* Match on address bytes only: the stored target address has no
-         * reliable address-type indicator (see ble_client.h), so the
-         * discovered advertisement's own type is used for the connect call
-         * below instead of a stored/guessed one. */
-        if (memcmp(event->disc.addr.val, s_target_addr, 6) != 0) {
-            return 0;
-        }
-
-        struct ble_hs_adv_fields fields;
-        if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) != 0) {
-            return 0;
-        }
-        if (fields.mfg_data == NULL || fields.mfg_data_len < 2) {
-            return 0;
-        }
-        uint16_t company_id = fields.mfg_data[0] | ((uint16_t)fields.mfg_data[1] << 8);
-        if (company_id != MFG_COMPANY_ID) {
-            return 0;
-        }
-
-        parse_manufacturer_data(fields.mfg_data + 2, fields.mfg_data_len - 2);
-
-        ble_gap_disc_cancel();
-
-        uint8_t own_addr_type;
-        int rc = ble_hs_id_infer_auto(0, &own_addr_type);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to infer own address type; rc=%d", rc);
-            finish_connect(ESP_FAIL);
-            return 0;
-        }
-        rc = ble_gap_connect(own_addr_type, &event->disc.addr, GAP_CONNECT_TIMEOUT_MS, NULL,
-                             gap_event_cb, NULL);
-        if (rc != 0) {
-            ESP_LOGE(TAG, "Failed to initiate connection; rc=%d", rc);
-            finish_connect(ESP_FAIL);
-        }
-        return 0;
-    }
-
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
@@ -380,33 +298,6 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     default:
         return 0;
-    }
-}
-
-static void blecent_scan(void)
-{
-    uint8_t own_addr_type;
-    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "error determining address type; rc=%d", rc);
-        return;
-    }
-
-    struct ble_gap_disc_params disc_params = {0};
-    disc_params.filter_duplicates = 0; /* keep re-checking the target device's adv data */
-    /* Passive scan. Active scanning was tried first on the theory that the
-     * manufacturer data (§1) might not fit in the primary advertising packet
-     * and would need a scan request to pull from the scan response, but that
-     * was never actually isolated as the fix (a separate address byte-order
-     * bug was blocking discovery at the same time), so it's worth trying
-     * passive again now that discovery is known to work. If matching stops
-     * finding the device after this change, that's the first thing to
-     * suspect: set disc_params.passive back to 0. */
-    disc_params.passive = 1;
-
-    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, gap_event_cb, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Error initiating GAP discovery; rc=%d", rc);
     }
 }
 
@@ -462,34 +353,38 @@ esp_err_t river2_ble_init(void)
     return ESP_OK;
 }
 
-esp_err_t river2_ble_connect(const uint8_t target_addr[6],
-                              char *out_serial, size_t out_serial_cap,
-                              uint8_t *out_encrypt_type, uint32_t timeout_ms)
+esp_err_t river2_ble_connect(const uint8_t target_addr[6], uint32_t timeout_ms)
 {
     /* `target_addr` arrives in conventional display order (as produced by
      * NVS's hex2bin from a string like "64E833C97C29"), but NimBLE's
      * ble_addr_t.val[] stores addresses reversed relative to that (val[0] is
      * the last displayed octet, see e.g. nimble_central_utils' addr_str(),
-     * which prints val[5..0]). Reverse here so the memcmp against
-     * event->disc.addr.val in gap_event_cb compares like with like. */
+     * which prints val[5..0]). Reverse here so ble_gap_connect() gets the
+     * address in NimBLE's order. */
+    ble_addr_t peer_addr = {.type = BLE_ADDR_PUBLIC};
     for (int i = 0; i < 6; i++) {
-        s_target_addr[i] = target_addr[5 - i];
-    }
-    s_out_serial = out_serial;
-    s_out_serial_cap = out_serial_cap;
-    s_out_encrypt_type = out_encrypt_type;
-    if (out_serial_cap > 0) {
-        out_serial[0] = '\0';
+        peer_addr.val[i] = target_addr[5 - i];
     }
 
     xQueueReset(s_notify_queue);
     xSemaphoreTake(s_ready_sem, 0); /* drain any stale signal */
 
-    blecent_scan();
+    uint8_t own_addr_type;
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "error determining address type; rc=%d", rc);
+        return ESP_FAIL;
+    }
+
+    rc = ble_gap_connect(own_addr_type, &peer_addr, GAP_CONNECT_TIMEOUT_MS, NULL, gap_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to initiate connection; rc=%d", rc);
+        return ESP_FAIL;
+    }
 
     if (xSemaphoreTake(s_ready_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
-        ble_gap_disc_cancel();
-        ESP_LOGE(TAG, "Timed out connecting/discovering the device");
+        ble_gap_conn_cancel();
+        ESP_LOGE(TAG, "Timed out connecting to the device");
         return ESP_ERR_TIMEOUT;
     }
     return s_conn_result;
