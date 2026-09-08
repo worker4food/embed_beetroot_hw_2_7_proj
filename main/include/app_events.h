@@ -8,8 +8,10 @@
 #define BLE_EVT_CONNECT_ERROR (1u << 2)
 #define BLE_EVT_DISCONNECTED  (1u << 3)
 
-/* river2_telemetry.h: battery-level event. */
+/* river2_telemetry.h: telemetry-derived state events. */
 #define RIVER2_TELEMETRY_EVT_BATTERY_LEVEL (1u << 4)
+#define RIVER2_TELEMETRY_EVT_DC_STATE      (1u << 7)
+#define RIVER2_TELEMETRY_EVT_AC_STATE      (1u << 8)
 
 /* app_main.c: pushbutton events. */
 #define TOGGLE_AC_PORT_EVT (1u << 5)

@@ -15,6 +15,9 @@
  * wifi_ver(4s,4) + wifi_auto_rcvy(B,1). */
 #define PD_SOC_OFFSET 14
 
+#define MPPT_CFG_AC_ENABLED_OFFSET 66
+#define MPPT_CAR_STATE_OFFSET 56
+
 typedef struct {
     river2_session_t session;
     TaskHandle_t owner_task;
@@ -22,6 +25,8 @@ typedef struct {
 } telemetry_ctx_t;
 
 static volatile int8_t s_battery_percent = -1;
+static volatile int8_t s_dc_out_state = -1;
+static volatile int8_t s_ac_enabled = -1;
 
 static void telemetry_task(void *arg)
 {
@@ -59,17 +64,41 @@ static void telemetry_task(void *arg)
             if (!river2_inner_parse(decrypted, decrypted_len, &pkt)) {
                 continue;
             }
-            if (pkt.src != RIVER2_ADDR_PD || pkt.cmd_set != RIVER2_CMDSET_PD_HEARTBEAT ||
-                pkt.cmd_id != RIVER2_CMDID_PD_HEARTBEAT || pkt.payload_len <= PD_SOC_OFFSET) {
+            if (pkt.cmd_id != RIVER2_CMDID_HEARTBEAT) {
                 continue;
             }
 
-            s_battery_percent = (int8_t)pkt.payload[PD_SOC_OFFSET];
+            /* Only the battery-level notification is throttled by interval_ms;
+             * DC/AC state notifications are edge-triggered. */
+            uint32_t notify_bits = 0;
+            if (pkt.src == RIVER2_ADDR_PD && pkt.cmd_set == RIVER2_CMDSET_HEARTBEAT) {
+                if (pkt.payload_len > PD_SOC_OFFSET) {
+                    s_battery_percent = (int8_t)pkt.payload[PD_SOC_OFFSET];
+                    int64_t now_us = esp_timer_get_time();
+                    if (now_us >= next_notify_us) {
+                        notify_bits |= RIVER2_TELEMETRY_EVT_BATTERY_LEVEL;
+                        next_notify_us = now_us + (int64_t)ctx->interval_ms * 1000;
+                    }
+                }
+            } else if (pkt.src == RIVER2_ADDR_MPPT) {
+                if (pkt.payload_len > MPPT_CFG_AC_ENABLED_OFFSET) {
+                    int8_t ac_enabled = (int8_t)pkt.payload[MPPT_CFG_AC_ENABLED_OFFSET];
+                    if (ac_enabled != s_ac_enabled) {
+                        s_ac_enabled = ac_enabled;
+                        notify_bits |= RIVER2_TELEMETRY_EVT_AC_STATE;
+                    }
+                }
+                if (pkt.payload_len > MPPT_CAR_STATE_OFFSET) {
+                    int8_t dc_out_state = (int8_t)pkt.payload[MPPT_CAR_STATE_OFFSET];
+                    if (dc_out_state != s_dc_out_state) {
+                        s_dc_out_state = dc_out_state;
+                        notify_bits |= RIVER2_TELEMETRY_EVT_DC_STATE;
+                    }
+                }
+            }
 
-            int64_t now_us = esp_timer_get_time();
-            if (now_us >= next_notify_us) {
-                xTaskNotify(ctx->owner_task, RIVER2_TELEMETRY_EVT_BATTERY_LEVEL, eSetBits);
-                next_notify_us = now_us + (int64_t)ctx->interval_ms * 1000;
+            if (notify_bits != 0) {
+                xTaskNotify(ctx->owner_task, notify_bits, eSetBits);
             }
         }
     }
@@ -97,4 +126,14 @@ esp_err_t river2_telemetry_start(const river2_session_t *session, TaskHandle_t o
 int river2_telemetry_battery_percent(void)
 {
     return s_battery_percent;
+}
+
+int river2_telemetry_dc_out_state(void)
+{
+    return s_dc_out_state;
+}
+
+int river2_telemetry_ac_enabled(void)
+{
+    return s_ac_enabled;
 }

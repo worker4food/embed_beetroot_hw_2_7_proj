@@ -1,4 +1,5 @@
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -13,6 +14,7 @@
 #include "config.h"
 #include "pushbutton.h"
 #include "river2_auth.h"
+#include "river2_commands.h"
 #include "river2_telemetry.h"
 
 ecoflow_config_t cfg;
@@ -119,17 +121,54 @@ void app_main(void)
     r = river2_telemetry_start(&session, xTaskGetCurrentTaskHandle(), BATTERY_LOG_INTERVAL_MS);
     ESP_RETURN_VOID_ON_ERROR(r, __func__, "river2_telemetry_start() failed");
 
+    bool ac_on = false;
+    bool dc_on = false;
+    bool ac_state_known = false;
+    bool dc_state_known = false;
+
     for (;;) {
         uint32_t bits = 0;
         xTaskNotifyWait(0, UINT32_MAX, &bits, portMAX_DELAY);
+        if (bits & RIVER2_TELEMETRY_EVT_AC_STATE) {
+            ac_on = river2_telemetry_ac_enabled() != 0;
+            ac_state_known = true;
+            ESP_LOGI(__func__, "AC port state known: %s", ac_on ? "on" : "off");
+        }
+        if (bits & RIVER2_TELEMETRY_EVT_DC_STATE) {
+            dc_on = river2_telemetry_dc_out_state() != 0;
+            dc_state_known = true;
+            ESP_LOGI(__func__, "DC port state known: %s", dc_on ? "on" : "off");
+        }
         if (bits & RIVER2_TELEMETRY_EVT_BATTERY_LEVEL) {
             ESP_LOGI(__func__, "Battery level: %d%%", river2_telemetry_battery_percent());
         }
         if (bits & TOGGLE_AC_PORT_EVT) {
-            ESP_LOGI(__func__, "Toggle AC port");
+            if (!ac_state_known) {
+                ESP_LOGW(__func__, "Ignoring AC toggle: AC port state not yet known");
+            } else {
+                bool want_on = !ac_on;
+                r = river2_set_ac_output(&session, want_on);
+                if (r != ESP_OK) {
+                    ESP_LOGE(__func__, "Failed to toggle AC port: %s", esp_err_to_name(r));
+                } else {
+                    ac_on = want_on;
+                    ESP_LOGI(__func__, "Toggled AC port %s", ac_on ? "on" : "off");
+                }
+            }
         }
         if (bits & TOGGLE_DC_PORT_EVT) {
-            ESP_LOGI(__func__, "Toggle DC port");
+            if (!dc_state_known) {
+                ESP_LOGW(__func__, "Ignoring DC toggle: DC port state not yet known");
+            } else {
+                bool want_on = !dc_on;
+                r = river2_set_dc_output(&session, want_on);
+                if (r != ESP_OK) {
+                    ESP_LOGE(__func__, "Failed to toggle DC port: %s", esp_err_to_name(r));
+                } else {
+                    dc_on = want_on;
+                    ESP_LOGI(__func__, "Toggled DC port %s", dc_on ? "on" : "off");
+                }
+            }
         }
     }
 }

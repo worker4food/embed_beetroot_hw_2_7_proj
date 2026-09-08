@@ -495,3 +495,9 @@ done:
     river2_framebuf_free(&fb);
     return err;
 }
+
+esp_err_t river2_send_command(const river2_session_t *session, uint8_t dst, uint8_t cmd_set,
+                               uint8_t cmd_id, const uint8_t *payload, size_t payload_len)
+{
+    return send_inner_encrypted(session, RIVER2_ADDR_APP, dst, cmd_set, cmd_id, payload, payload_len);
+}

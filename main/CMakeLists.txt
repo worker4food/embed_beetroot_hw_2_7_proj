@@ -4,6 +4,7 @@ idf_component_register(
         "src/config.c"
         "src/ble_client.c"
         "src/river2_auth.c"
+        "src/river2_commands.c"
         "src/river2_crc.c"
         "src/river2_ecdh.c"
         "src/river2_packet.c"

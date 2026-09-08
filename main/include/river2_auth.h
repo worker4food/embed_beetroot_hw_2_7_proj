@@ -39,3 +39,10 @@ esp_err_t river2_session_decrypt(const river2_session_t *session, const uint8_t 
  * fingerprint of cfg->lookup_table) as well as internal use by
  * river2_auth_run(). */
 void river2_md5(const uint8_t *data, size_t len, uint8_t out[16]);
+
+/* Sends a command to the device under an authenticated `session`: builds,
+ * encrypts, and writes the inner packet. `dst`/`cmd_set`/`cmd_id`/payload
+ * come from the command table in protocol doc §6. Call after
+ * river2_auth_run() succeeds. */
+esp_err_t river2_send_command(const river2_session_t *session, uint8_t dst, uint8_t cmd_set,
+                               uint8_t cmd_id, const uint8_t *payload, size_t payload_len);
