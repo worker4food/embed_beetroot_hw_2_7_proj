@@ -166,7 +166,7 @@ bool river2_framebuf_extract(river2_framebuf_t *fb, uint8_t *frame_type,
             return false; /* header incomplete, wait for more data */
         }
 
-        uint16_t payload_field = rd_u16le(&fb->data[4]); /* encrypted payload len + 2 */
+        uint16_t payload_field = rd_u16le(&fb->data[4]); /* payload len + 2 trailing crc16 bytes */
         if (payload_field < 2 || payload_field > 4096) {
             /* Corrupt/implausible length: this prefix was spurious, skip it. */
             framebuf_consume(fb, 2);

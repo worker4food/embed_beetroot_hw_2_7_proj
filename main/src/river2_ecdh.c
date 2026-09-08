@@ -1,6 +1,6 @@
 /*
  * ECDH key exchange on SECP160r1 for the River2Pro handshake (protocol doc §3.1),
- * built on the vendored micro-ecc library (main/micro-ecc), which supports
+ * built on the vendored micro-ecc library (components/micro-ecc), which supports
  * secp160r1 as a first-class curve, unlike this ESP-IDF's mbedtls, whose
  * curve list only goes down to secp192r1/secp256k1.
  */

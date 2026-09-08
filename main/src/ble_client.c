@@ -3,7 +3,6 @@
 
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
@@ -43,21 +42,26 @@ static const uint8_t NUS_NOTIFY_UUID[16] = {
     0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e,
 };
 
-typedef struct {
-    uint8_t *data;
-    size_t len;
-} notif_msg_t;
+typedef enum {
+    BLE_EVENT_HOST_SYNC,
+    BLE_EVENT_CONNECT_DONE,
+    BLE_EVENT_NOTIFY,
+} ble_event_type_t;
 
-static SemaphoreHandle_t s_sync_sem;
-static SemaphoreHandle_t s_ready_sem;
-static QueueHandle_t s_notify_queue;
+typedef struct {
+    ble_event_type_t type;
+    esp_err_t connect_result; /* BLE_EVENT_CONNECT_DONE */
+    uint8_t *notify_data;     /* BLE_EVENT_NOTIFY */
+    size_t notify_len;        /* BLE_EVENT_NOTIFY */
+} ble_event_t;
+
+static QueueHandle_t s_ble_queue;
 
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_write_handle;
 static uint16_t s_notify_handle;
 static uint16_t s_notify_svc_end;
 static bool s_cccd_found;
-static esp_err_t s_conn_result;
 
 static struct {
     uint16_t start;
@@ -77,8 +81,8 @@ static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 
 static void finish_connect(esp_err_t result)
 {
-    s_conn_result = result;
-    xSemaphoreGive(s_ready_sem);
+    ble_event_t evt = {.type = BLE_EVENT_CONNECT_DONE, .connect_result = result};
+    xQueueSend(s_ble_queue, &evt, 0);
 }
 
 static bool uuid_matches(const ble_uuid_t *u, const uint8_t bytes[16])
@@ -288,9 +292,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             free(buf);
             return 0;
         }
-        notif_msg_t msg = {.data = buf, .len = out_len};
-        if (xQueueSend(s_notify_queue, &msg, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Notification queue full, dropping %u bytes", out_len);
+        ble_event_t evt = {.type = BLE_EVENT_NOTIFY, .notify_data = buf, .notify_len = out_len};
+        if (xQueueSend(s_ble_queue, &evt, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "BLE event queue full, dropping %u bytes", out_len);
             free(buf);
         }
         return 0;
@@ -312,7 +316,8 @@ static void on_sync(void)
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_hs_util_ensure_addr failed; rc=%d", rc);
     }
-    xSemaphoreGive(s_sync_sem);
+    ble_event_t evt = {.type = BLE_EVENT_HOST_SYNC};
+    xQueueSend(s_ble_queue, &evt, 0);
 }
 
 static void host_task(void *param)
@@ -324,10 +329,8 @@ static void host_task(void *param)
 
 esp_err_t river2_ble_init(void)
 {
-    s_sync_sem = xSemaphoreCreateBinary();
-    s_ready_sem = xSemaphoreCreateBinary();
-    s_notify_queue = xQueueCreate(16, sizeof(notif_msg_t));
-    if (s_sync_sem == NULL || s_ready_sem == NULL || s_notify_queue == NULL) {
+    s_ble_queue = xQueueCreate(16, sizeof(ble_event_t));
+    if (s_ble_queue == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -346,7 +349,9 @@ esp_err_t river2_ble_init(void)
 
     nimble_port_freertos_init(host_task);
 
-    if (xSemaphoreTake(s_sync_sem, pdMS_TO_TICKS(HOST_SYNC_TIMEOUT_MS)) != pdTRUE) {
+    ble_event_t evt;
+    if (xQueueReceive(s_ble_queue, &evt, pdMS_TO_TICKS(HOST_SYNC_TIMEOUT_MS)) != pdTRUE ||
+        evt.type != BLE_EVENT_HOST_SYNC) {
         ESP_LOGE(TAG, "Timed out waiting for NimBLE host sync");
         return ESP_ERR_TIMEOUT;
     }
@@ -366,8 +371,7 @@ esp_err_t river2_ble_connect(const uint8_t target_addr[6], uint32_t timeout_ms)
         peer_addr.val[i] = target_addr[5 - i];
     }
 
-    xQueueReset(s_notify_queue);
-    xSemaphoreTake(s_ready_sem, 0); /* drain any stale signal */
+    xQueueReset(s_ble_queue); /* drop any stale events from a previous connection attempt */
 
     uint8_t own_addr_type;
     int rc = ble_hs_id_infer_auto(0, &own_addr_type);
@@ -382,12 +386,14 @@ esp_err_t river2_ble_connect(const uint8_t target_addr[6], uint32_t timeout_ms)
         return ESP_FAIL;
     }
 
-    if (xSemaphoreTake(s_ready_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    ble_event_t evt;
+    if (xQueueReceive(s_ble_queue, &evt, pdMS_TO_TICKS(timeout_ms)) != pdTRUE ||
+        evt.type != BLE_EVENT_CONNECT_DONE) {
         ble_gap_conn_cancel();
         ESP_LOGE(TAG, "Timed out connecting to the device");
         return ESP_ERR_TIMEOUT;
     }
-    return s_conn_result;
+    return evt.connect_result;
 }
 
 esp_err_t river2_ble_write(const uint8_t *data, size_t len)
@@ -406,13 +412,17 @@ esp_err_t river2_ble_write(const uint8_t *data, size_t len)
 esp_err_t river2_ble_wait_notification(uint8_t *out_buf, size_t out_cap, size_t *out_len,
                                         uint32_t timeout_ms)
 {
-    notif_msg_t msg;
-    if (xQueueReceive(s_notify_queue, &msg, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+    ble_event_t evt;
+    if (xQueueReceive(s_ble_queue, &evt, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    size_t copy_len = msg.len < out_cap ? msg.len : out_cap;
-    memcpy(out_buf, msg.data, copy_len);
+    if (evt.type != BLE_EVENT_NOTIFY) {
+        ESP_LOGE(TAG, "Unexpected BLE event type %d while waiting for a notification", evt.type);
+        return ESP_ERR_INVALID_STATE;
+    }
+    size_t copy_len = evt.notify_len < out_cap ? evt.notify_len : out_cap;
+    memcpy(out_buf, evt.notify_data, copy_len);
     *out_len = copy_len;
-    free(msg.data);
+    free(evt.notify_data);
     return ESP_OK;
 }

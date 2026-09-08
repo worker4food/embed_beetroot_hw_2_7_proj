@@ -24,7 +24,7 @@ ecoflow_config_t cfg;
  * (protocol doc §5) that this project doesn't parse. Nothing else drains
  * river2_ble_wait_notification()'s queue after app_main() returns, so this
  * discards them to keep the link healthy instead of letting the queue fill up
- * and log "Notification queue full" warnings indefinitely. */
+ * and log "BLE event queue full" warnings indefinitely. */
 static void notification_sink_task(void *arg)
 {
     (void)arg;
@@ -38,11 +38,6 @@ static void notification_sink_task(void *arg)
         river2_ble_wait_notification(buf, sizeof(buf), &len, NOTIFICATION_SINK_POLL_TIMEOUT_MS);
     }
 }
-
-/* cfg.ef_mac layout: [0:6]=the 6-byte device BLE address, [6:8]=unused
- * padding (the stored NVS blob is only 6 bytes; nvs_get_blob() accepts a
- * larger destination buffer, leaving the rest zeroed). Its address *type*
- * isn't stored; river2_ble_connect() assumes a public address. */
 
 void app_main(void)
 {
@@ -72,8 +67,6 @@ void app_main(void)
 
     r = river2_ble_connect(cfg.ef_mac, BLE_CONNECT_TIMEOUT_MS);
     ESP_RETURN_VOID_ON_ERROR(r, __func__, "river2_ble_connect() failed");
-
-    ESP_LOGI(__func__, "Connected to device serial=%s", cfg.ef_serial);
 
     r = river2_auth_run(&cfg, cfg.ef_serial);
     if (r != ESP_OK) {
