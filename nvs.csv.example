@@ -1,0 +1,5 @@
+key,type,encoding,value
+ecoflow,namespace,,
+ef_user,data,string,12345678901234567890
+ef_mac,data,hex2bin,0a0b0c0d
+lookup_table,file,base64,../lookup_table.b64

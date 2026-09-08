@@ -1,0 +1,523 @@
+#include <stdbool.h>
+#include <string.h>
+
+#include <esp_log.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
+#include <nimble/nimble_port.h>
+#include <nimble/nimble_port_freertos.h>
+#include <host/ble_hs.h>
+#include <host/ble_uuid.h>
+#include <host/util/util.h>
+#include <services/gap/ble_svc_gap.h>
+
+#include "ble_client.h"
+
+static const char *TAG = "ble_client";
+
+#define MFG_COMPANY_ID 0xB5B5
+#define MAX_SERVICES 24
+#define HOST_SYNC_TIMEOUT_MS 10000
+#define GAP_CONNECT_TIMEOUT_MS 30000
+
+/* Manufacturer-data layout, protocol doc §1 (offsets from the AD payload
+ * after the 2-byte company id): [0]=proto_version [1:17]=serial [17]=status
+ * [18]=product_type [22]=capability_flags (if present). */
+#define MFG_SERIAL_OFFSET 1
+#define MFG_SERIAL_LEN 16
+#define MFG_MIN_LEN_FOR_SERIAL (MFG_SERIAL_OFFSET + MFG_SERIAL_LEN)  /* proto_version + serial */
+#define MFG_CAPABILITY_FLAGS_OFFSET 22
+#define MFG_MIN_LEN_FOR_CAPABILITY_FLAGS 19 /* + status(1) + product_type(1) */
+#define MFG_DEFAULT_CAPABILITY_FLAGS 0x38   /* => encrypt_type=7, absent flags default */
+#define MFG_ENCRYPT_TYPE_MASK 0x38
+#define MFG_ENCRYPT_TYPE_SHIFT 3
+
+extern void ble_store_config_init(void);
+
+/* GATT characteristic UUIDs to try (protocol doc §2). The "rfcomm-style"
+ * pair's 128-bit form (00000002/00000003-0000-1000-8000-00805f9b34fb) is the
+ * Bluetooth SIG Base UUID expansion of 16-bit UUIDs 0x0002/0x0003. Real
+ * devices have been observed sending them as native 16-bit UUIDs on the wire,
+ * which ble_uuid_cmp() never treats as equal to their 128-bit expansion (it
+ * only compares same-width UUIDs), so both widths are matched here. */
+static const uint8_t RFCOMM_WRITE_UUID128[16] = {
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+};
+static const uint8_t RFCOMM_NOTIFY_UUID128[16] = {
+    0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+};
+#define RFCOMM_WRITE_UUID16 0x0002
+#define RFCOMM_NOTIFY_UUID16 0x0003
+static const uint8_t NUS_WRITE_UUID[16] = {
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x6e,
+};
+static const uint8_t NUS_NOTIFY_UUID[16] = {
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e,
+};
+
+typedef struct {
+    uint8_t *data;
+    size_t len;
+} notif_msg_t;
+
+static SemaphoreHandle_t s_sync_sem;
+static SemaphoreHandle_t s_ready_sem;
+static QueueHandle_t s_notify_queue;
+
+static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_write_handle;
+static uint16_t s_notify_handle;
+static uint16_t s_notify_svc_end;
+static bool s_cccd_found;
+static esp_err_t s_conn_result;
+
+static struct {
+    uint16_t start;
+    uint16_t end;
+} s_services[MAX_SERVICES];
+static int s_service_count;
+static int s_service_idx;
+
+static uint8_t s_target_addr[6];
+static char *s_out_serial;
+static size_t s_out_serial_cap;
+static uint8_t *s_out_encrypt_type;
+
+/* forward declarations: the discovery chain calls these out of file order
+ * (each begin_*_discovery() kicks off the next stage's callback). */
+static int disc_dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg);
+static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_chr *chr, void *arg);
+static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_svc *service, void *arg);
+
+static void finish_connect(esp_err_t result)
+{
+    s_conn_result = result;
+    xSemaphoreGive(s_ready_sem);
+}
+
+static bool uuid_matches(const ble_uuid_t *u, const uint8_t bytes[16])
+{
+    ble_uuid128_t candidate;
+    candidate.u.type = BLE_UUID_TYPE_128;
+    memcpy(candidate.value, bytes, 16);
+    return ble_uuid_cmp(u, &candidate.u) == 0;
+}
+
+static bool uuid_matches16(const ble_uuid_t *u, uint16_t value)
+{
+    ble_uuid16_t candidate = {.u = {.type = BLE_UUID_TYPE_16}, .value = value};
+    return ble_uuid_cmp(u, &candidate.u) == 0;
+}
+
+static void begin_descriptor_discovery(void)
+{
+    int rc = ble_gattc_disc_all_dscs(s_conn_handle, s_notify_handle, s_notify_svc_end,
+                                      disc_dsc_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to start descriptor discovery; rc=%d", rc);
+        finish_connect(ESP_FAIL);
+    }
+}
+
+static int on_cccd_write(uint16_t conn_handle, const struct ble_gatt_error *error,
+                          struct ble_gatt_attr *attr, void *arg)
+{
+    (void)conn_handle;
+    (void)attr;
+    (void)arg;
+    if (error->status != 0) {
+        ESP_LOGE(TAG, "Failed to write CCCD; status=%d", error->status);
+        finish_connect(ESP_FAIL);
+        return 0;
+    }
+    ESP_LOGI(TAG, "Subscribed to notifications");
+    finish_connect(ESP_OK);
+    return 0;
+}
+
+static int disc_dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg)
+{
+    (void)chr_val_handle;
+    (void)arg;
+
+    if (error->status == 0) {
+        if (!s_cccd_found &&
+            ble_uuid_cmp(&dsc->uuid.u, BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16)) == 0) {
+            s_cccd_found = true;
+            uint8_t val[2] = {0x01, 0x00};
+            int rc = ble_gattc_write_flat(conn_handle, dsc->handle, val, sizeof(val),
+                                           on_cccd_write, NULL);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "Failed to write CCCD; rc=%d", rc);
+                finish_connect(ESP_FAIL);
+            }
+        }
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE) {
+        if (!s_cccd_found) {
+            ESP_LOGE(TAG, "Notify characteristic has no CCCD descriptor");
+            finish_connect(ESP_ERR_NOT_FOUND);
+        }
+        return 0;
+    }
+
+    ESP_LOGE(TAG, "Descriptor discovery failed; status=%d", error->status);
+    finish_connect(ESP_FAIL);
+    return 0;
+}
+
+static void begin_chr_discovery_for_service(int idx)
+{
+    int rc = ble_gattc_disc_all_chrs(s_conn_handle, s_services[idx].start, s_services[idx].end,
+                                      disc_chr_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to start characteristic discovery; rc=%d", rc);
+        finish_connect(ESP_FAIL);
+    }
+}
+
+static int disc_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_chr *chr, void *arg)
+{
+    (void)conn_handle;
+    (void)arg;
+
+    if (error->status == 0) {
+        char uuid_str[BLE_UUID_STR_LEN];
+        ESP_LOGI(TAG, "  chr uuid=%s val_handle=%u properties=0x%02x",
+                 ble_uuid_to_str(&chr->uuid.u, uuid_str), chr->val_handle, chr->properties);
+
+        if (s_write_handle == 0 &&
+            (uuid_matches(&chr->uuid.u, RFCOMM_WRITE_UUID128) ||
+             uuid_matches16(&chr->uuid.u, RFCOMM_WRITE_UUID16) ||
+             uuid_matches(&chr->uuid.u, NUS_WRITE_UUID))) {
+            s_write_handle = chr->val_handle;
+            ESP_LOGI(TAG, "Found write characteristic, handle=%u", s_write_handle);
+        }
+        if (s_notify_handle == 0 &&
+            (uuid_matches(&chr->uuid.u, RFCOMM_NOTIFY_UUID128) ||
+             uuid_matches16(&chr->uuid.u, RFCOMM_NOTIFY_UUID16) ||
+             uuid_matches(&chr->uuid.u, NUS_NOTIFY_UUID))) {
+            s_notify_handle = chr->val_handle;
+            s_notify_svc_end = s_services[s_service_idx].end;
+            ESP_LOGI(TAG, "Found notify characteristic, handle=%u", s_notify_handle);
+        }
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE) {
+        s_service_idx++;
+        if (s_service_idx < s_service_count) {
+            begin_chr_discovery_for_service(s_service_idx);
+        } else if (s_write_handle == 0 || s_notify_handle == 0) {
+            ESP_LOGE(TAG, "Device does not expose a supported characteristic pair");
+            finish_connect(ESP_ERR_NOT_SUPPORTED);
+        } else {
+            begin_descriptor_discovery();
+        }
+        return 0;
+    }
+
+    ESP_LOGE(TAG, "Characteristic discovery failed; status=%d", error->status);
+    finish_connect(ESP_FAIL);
+    return 0;
+}
+
+static int disc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
+                        const struct ble_gatt_svc *service, void *arg)
+{
+    (void)conn_handle;
+    (void)arg;
+
+    if (error->status == 0) {
+        char uuid_str[BLE_UUID_STR_LEN];
+        ESP_LOGI(TAG, "svc uuid=%s start=%u end=%u", ble_uuid_to_str(&service->uuid.u, uuid_str),
+                 service->start_handle, service->end_handle);
+
+        if (s_service_count < MAX_SERVICES) {
+            s_services[s_service_count].start = service->start_handle;
+            s_services[s_service_count].end = service->end_handle;
+            s_service_count++;
+        }
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE) {
+        if (s_service_count == 0) {
+            ESP_LOGE(TAG, "Device exposes no GATT services");
+            finish_connect(ESP_ERR_NOT_FOUND);
+            return 0;
+        }
+        s_service_idx = 0;
+        begin_chr_discovery_for_service(0);
+        return 0;
+    }
+
+    ESP_LOGE(TAG, "Service discovery failed; status=%d", error->status);
+    finish_connect(ESP_FAIL);
+    return 0;
+}
+
+static void parse_manufacturer_data(const uint8_t *mfg_data, size_t mfg_len)
+{
+    if (mfg_len < MFG_MIN_LEN_FOR_SERIAL) {
+        return;
+    }
+
+    size_t serial_cap = s_out_serial_cap > 0 ? s_out_serial_cap - 1 : 0;
+    size_t n = MFG_SERIAL_LEN < serial_cap ? MFG_SERIAL_LEN : serial_cap;
+    memcpy(s_out_serial, &mfg_data[MFG_SERIAL_OFFSET], n);
+    s_out_serial[n] = '\0';
+    /* null-strip: trim at the first embedded NUL, if any */
+    for (size_t i = 0; i < n; i++) {
+        if (s_out_serial[i] == '\0') {
+            break;
+        }
+    }
+
+    uint8_t capability_flags = (mfg_len > MFG_MIN_LEN_FOR_CAPABILITY_FLAGS)
+                                    ? mfg_data[MFG_CAPABILITY_FLAGS_OFFSET]
+                                    : MFG_DEFAULT_CAPABILITY_FLAGS;
+    *s_out_encrypt_type = (capability_flags & MFG_ENCRYPT_TYPE_MASK) >> MFG_ENCRYPT_TYPE_SHIFT;
+}
+
+static int gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+
+    switch (event->type) {
+    case BLE_GAP_EVENT_DISC: {
+        /* Match on address bytes only: the stored target address has no
+         * reliable address-type indicator (see ble_client.h), so the
+         * discovered advertisement's own type is used for the connect call
+         * below instead of a stored/guessed one. */
+        if (memcmp(event->disc.addr.val, s_target_addr, 6) != 0) {
+            return 0;
+        }
+
+        struct ble_hs_adv_fields fields;
+        if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) != 0) {
+            return 0;
+        }
+        if (fields.mfg_data == NULL || fields.mfg_data_len < 2) {
+            return 0;
+        }
+        uint16_t company_id = fields.mfg_data[0] | ((uint16_t)fields.mfg_data[1] << 8);
+        if (company_id != MFG_COMPANY_ID) {
+            return 0;
+        }
+
+        parse_manufacturer_data(fields.mfg_data + 2, fields.mfg_data_len - 2);
+
+        ble_gap_disc_cancel();
+
+        uint8_t own_addr_type;
+        int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to infer own address type; rc=%d", rc);
+            finish_connect(ESP_FAIL);
+            return 0;
+        }
+        rc = ble_gap_connect(own_addr_type, &event->disc.addr, GAP_CONNECT_TIMEOUT_MS, NULL,
+                             gap_event_cb, NULL);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to initiate connection; rc=%d", rc);
+            finish_connect(ESP_FAIL);
+        }
+        return 0;
+    }
+
+    case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0) {
+            s_conn_handle = event->connect.conn_handle;
+            s_service_count = 0;
+            s_service_idx = 0;
+            s_write_handle = 0;
+            s_notify_handle = 0;
+            s_cccd_found = false;
+            ESP_LOGI(TAG, "Connected, discovering services");
+            int rc = ble_gattc_disc_all_svcs(s_conn_handle, disc_svc_cb, NULL);
+            if (rc != 0) {
+                ESP_LOGE(TAG, "Failed to start service discovery; rc=%d", rc);
+                finish_connect(ESP_FAIL);
+            }
+        } else {
+            ESP_LOGE(TAG, "Connection failed; status=%d", event->connect.status);
+            finish_connect(ESP_FAIL);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGW(TAG, "Disconnected; reason=%d", event->disconnect.reason);
+        s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        return 0;
+
+    case BLE_GAP_EVENT_NOTIFY_RX: {
+        int len = OS_MBUF_PKTLEN(event->notify_rx.om);
+        if (len <= 0) {
+            return 0;
+        }
+        uint8_t *buf = malloc((size_t)len);
+        if (buf == NULL) {
+            return 0;
+        }
+        uint16_t out_len = 0;
+        if (ble_hs_mbuf_to_flat(event->notify_rx.om, buf, (uint16_t)len, &out_len) != 0) {
+            free(buf);
+            return 0;
+        }
+        notif_msg_t msg = {.data = buf, .len = out_len};
+        if (xQueueSend(s_notify_queue, &msg, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Notification queue full, dropping %u bytes", out_len);
+            free(buf);
+        }
+        return 0;
+    }
+
+    default:
+        return 0;
+    }
+}
+
+static void blecent_scan(void)
+{
+    uint8_t own_addr_type;
+    int rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "error determining address type; rc=%d", rc);
+        return;
+    }
+
+    struct ble_gap_disc_params disc_params = {0};
+    disc_params.filter_duplicates = 0; /* keep re-checking the target device's adv data */
+    /* Passive scan. Active scanning was tried first on the theory that the
+     * manufacturer data (§1) might not fit in the primary advertising packet
+     * and would need a scan request to pull from the scan response, but that
+     * was never actually isolated as the fix (a separate address byte-order
+     * bug was blocking discovery at the same time), so it's worth trying
+     * passive again now that discovery is known to work. If matching stops
+     * finding the device after this change, that's the first thing to
+     * suspect: set disc_params.passive back to 0. */
+    disc_params.passive = 1;
+
+    rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &disc_params, gap_event_cb, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Error initiating GAP discovery; rc=%d", rc);
+    }
+}
+
+static void on_reset(int reason)
+{
+    ESP_LOGE(TAG, "NimBLE host reset; reason=%d", reason);
+}
+
+static void on_sync(void)
+{
+    int rc = ble_hs_util_ensure_addr(0);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_util_ensure_addr failed; rc=%d", rc);
+    }
+    xSemaphoreGive(s_sync_sem);
+}
+
+static void host_task(void *param)
+{
+    (void)param;
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+esp_err_t river2_ble_init(void)
+{
+    s_sync_sem = xSemaphoreCreateBinary();
+    s_ready_sem = xSemaphoreCreateBinary();
+    s_notify_queue = xQueueCreate(16, sizeof(notif_msg_t));
+    if (s_sync_sem == NULL || s_ready_sem == NULL || s_notify_queue == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to init NimBLE port: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sync_cb = on_sync;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+
+    ble_svc_gap_device_name_set("river2pro-bridge");
+    ble_store_config_init();
+
+    nimble_port_freertos_init(host_task);
+
+    if (xSemaphoreTake(s_sync_sem, pdMS_TO_TICKS(HOST_SYNC_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "Timed out waiting for NimBLE host sync");
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+esp_err_t river2_ble_connect(const uint8_t target_addr[6],
+                              char *out_serial, size_t out_serial_cap,
+                              uint8_t *out_encrypt_type, uint32_t timeout_ms)
+{
+    /* `target_addr` arrives in conventional display order (as produced by
+     * NVS's hex2bin from a string like "64E833C97C29"), but NimBLE's
+     * ble_addr_t.val[] stores addresses reversed relative to that (val[0] is
+     * the last displayed octet, see e.g. nimble_central_utils' addr_str(),
+     * which prints val[5..0]). Reverse here so the memcmp against
+     * event->disc.addr.val in gap_event_cb compares like with like. */
+    for (int i = 0; i < 6; i++) {
+        s_target_addr[i] = target_addr[5 - i];
+    }
+    s_out_serial = out_serial;
+    s_out_serial_cap = out_serial_cap;
+    s_out_encrypt_type = out_encrypt_type;
+    if (out_serial_cap > 0) {
+        out_serial[0] = '\0';
+    }
+
+    xQueueReset(s_notify_queue);
+    xSemaphoreTake(s_ready_sem, 0); /* drain any stale signal */
+
+    blecent_scan();
+
+    if (xSemaphoreTake(s_ready_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ble_gap_disc_cancel();
+        ESP_LOGE(TAG, "Timed out connecting/discovering the device");
+        return ESP_ERR_TIMEOUT;
+    }
+    return s_conn_result;
+}
+
+esp_err_t river2_ble_write(const uint8_t *data, size_t len)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_write_handle == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    int rc = ble_gattc_write_flat(s_conn_handle, s_write_handle, data, len, NULL, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "GATT write failed; rc=%d", rc);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t river2_ble_wait_notification(uint8_t *out_buf, size_t out_cap, size_t *out_len,
+                                        uint32_t timeout_ms)
+{
+    notif_msg_t msg;
+    if (xQueueReceive(s_notify_queue, &msg, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    size_t copy_len = msg.len < out_cap ? msg.len : out_cap;
+    memcpy(out_buf, msg.data, copy_len);
+    *out_len = copy_len;
+    free(msg.data);
+    return ESP_OK;
+}
