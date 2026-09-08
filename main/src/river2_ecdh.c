@@ -17,8 +17,6 @@
 
 #define RIVER2_ECDH_PRIVKEY_SIZE 21 /* secp160r1 order needs 21 bytes; see uECC.h */
 
-static const char *TAG = "river2_ecdh";
-
 struct river2_ecdh_ctx {
     uint8_t priv[RIVER2_ECDH_PRIVKEY_SIZE];
 };
@@ -49,7 +47,7 @@ esp_err_t river2_ecdh_gen_keypair(river2_ecdh_ctx_t **out_ctx,
     }
 
     if (!uECC_make_key(out_pubkey, ctx->priv, uECC_secp160r1())) {
-        ESP_LOGE(TAG, "uECC_make_key failed");
+        ESP_LOGE(__func__, "uECC_make_key failed");
         free(ctx);
         return ESP_FAIL;
     }
@@ -63,18 +61,18 @@ esp_err_t river2_ecdh_shared_secret(river2_ecdh_ctx_t *ctx,
                                      uint8_t out_secret[RIVER2_ECDH_COORD_SIZE])
 {
     if (peer_pubkey_len != RIVER2_ECDH_PUBKEY_SIZE) {
-        ESP_LOGE(TAG, "Unexpected peer public key size %u (want %u)",
+        ESP_LOGE(__func__, "Unexpected peer public key size %u (want %u)",
                  (unsigned)peer_pubkey_len, (unsigned)RIVER2_ECDH_PUBKEY_SIZE);
         return ESP_ERR_INVALID_SIZE;
     }
 
     if (!uECC_valid_public_key(peer_pubkey, uECC_secp160r1())) {
-        ESP_LOGE(TAG, "Device public key is not a valid secp160r1 point");
+        ESP_LOGE(__func__, "Device public key is not a valid secp160r1 point");
         return ESP_ERR_INVALID_ARG;
     }
 
     if (!uECC_shared_secret(peer_pubkey, ctx->priv, out_secret, uECC_secp160r1())) {
-        ESP_LOGE(TAG, "uECC_shared_secret failed");
+        ESP_LOGE(__func__, "uECC_shared_secret failed");
         return ESP_FAIL;
     }
     return ESP_OK;

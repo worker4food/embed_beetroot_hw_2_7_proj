@@ -7,6 +7,7 @@ idf_component_register(
         "src/river2_crc.c"
         "src/river2_ecdh.c"
         "src/river2_packet.c"
+        "src/river2_telemetry.c"
     INCLUDE_DIRS "include"
     REQUIRES
         nvs_flash

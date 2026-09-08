@@ -12,15 +12,8 @@
 #include "river2_ecdh.h"
 #include "river2_packet.h"
 
-static const char *TAG = "river2_auth";
-
 #define STEP_TIMEOUT_MS 20000
 #define NOTIFY_CHUNK_MAX 512
-
-typedef struct {
-    uint8_t key[16];
-    uint8_t iv[16];
-} cipher_t;
 
 static void ensure_psa_crypto_init(void)
 {
@@ -50,7 +43,7 @@ static esp_err_t import_aes_key(const uint8_t key[16], psa_key_usage_t usage, ps
     return psa_import_key(&attr, key, 16, out_key_id) == PSA_SUCCESS ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t aes_cbc_encrypt_pkcs7(const cipher_t *c, const uint8_t *in, size_t in_len,
+static esp_err_t aes_cbc_encrypt_pkcs7(const river2_session_t *c, const uint8_t *in, size_t in_len,
                                         uint8_t *out, size_t out_cap, size_t *out_len)
 {
     ensure_psa_crypto_init();
@@ -90,8 +83,8 @@ static esp_err_t aes_cbc_encrypt_pkcs7(const cipher_t *c, const uint8_t *in, siz
  * raw decrypted bytes as-is. Decrypting with PSA_ALG_CBC_NO_PADDING (rather
  * than asking PSA to remove PKCS7 padding) is what makes the fallback
  * possible: PSA_ALG_CBC_PKCS7 would just fail the whole call on bad padding. */
-static esp_err_t aes_cbc_decrypt_lenient(const cipher_t *c, const uint8_t *in, size_t in_len,
-                                          uint8_t *out, size_t out_cap, size_t *out_len)
+esp_err_t river2_session_decrypt(const river2_session_t *c, const uint8_t *in, size_t in_len,
+                                  uint8_t *out, size_t out_cap, size_t *out_len)
 {
     size_t aligned = in_len - (in_len % 16);
     if (aligned == 0) {
@@ -156,7 +149,7 @@ static esp_err_t wait_for_frame(river2_framebuf_t *fb, uint8_t want_frame_type,
             if (frame_type == want_frame_type) {
                 return ESP_OK;
             }
-            ESP_LOGD(TAG, "Skipping frame_type=%u while waiting for %u", frame_type,
+            ESP_LOGD(__func__, "Skipping frame_type=%u while waiting for %u", frame_type,
                      want_frame_type);
             continue;
         }
@@ -187,13 +180,13 @@ static esp_err_t send_frame(uint8_t frame_type, const uint8_t *payload, size_t p
     uint8_t frame[600];
     size_t frame_len = river2_outer_build(frame_type, payload, payload_len, frame, sizeof(frame));
     if (frame_len == 0) {
-        ESP_LOGE(TAG, "Frame too large to encode (%u bytes payload)", (unsigned)payload_len);
+        ESP_LOGE(__func__, "Frame too large to encode (%u bytes payload)", (unsigned)payload_len);
         return ESP_ERR_INVALID_SIZE;
     }
     return river2_ble_write(frame, frame_len);
 }
 
-static esp_err_t send_inner_encrypted(const cipher_t *cipher, uint8_t src, uint8_t dst,
+static esp_err_t send_inner_encrypted(const river2_session_t *cipher, uint8_t src, uint8_t dst,
                                        uint8_t cmd_set, uint8_t cmd_id,
                                        const uint8_t *payload, size_t payload_len)
 {
@@ -224,7 +217,7 @@ static esp_err_t derive_session_key(const ecoflow_config_t *cfg, const uint8_t s
 {
     int pos = (int)seed[0] * 0x10 + (((int)seed[1] - 1) & 0xFF) * 0x100;
     if (pos < 0 || (size_t)pos + 16 > sizeof(cfg->lookup_table)) {
-        ESP_LOGE(TAG, "Session key lookup position %d out of bounds", pos);
+        ESP_LOGE(__func__, "Session key lookup position %d out of bounds", pos);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -251,7 +244,8 @@ static const char *auth_error_name(uint8_t code)
     }
 }
 
-esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
+esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial,
+                           river2_session_t *out_session)
 {
     esp_err_t err;
     river2_framebuf_t fb;
@@ -270,22 +264,22 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         memcpy(payload + 2, our_pub, sizeof(our_pub));
         err = send_frame(RIVER2_FRAME_COMMAND, payload, sizeof(payload));
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send public key: %s", esp_err_to_name(err));
+            ESP_LOGE(__func__, "Failed to send public key: %s", esp_err_to_name(err));
             goto done;
         }
     }
 
-    cipher_t interim;
+    river2_session_t interim;
     {
         const uint8_t *reply;
         size_t reply_len;
         err = wait_for_frame(&fb, RIVER2_FRAME_COMMAND, &reply, &reply_len, STEP_TIMEOUT_MS);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Timed out waiting for public key reply");
+            ESP_LOGE(__func__, "Timed out waiting for public key reply");
             goto done;
         }
         if (reply_len < 3 || reply[0] != 0x01) {
-            ESP_LOGE(TAG, "Unexpected public key reply (type=%u len=%u)",
+            ESP_LOGE(__func__, "Unexpected public key reply (type=%u len=%u)",
                      reply_len ? reply[0] : 0xFF, (unsigned)reply_len);
             err = ESP_ERR_INVALID_RESPONSE;
             goto done;
@@ -301,13 +295,13 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         default: dev_pub_size = 40; break;
         }
         if (dev_pub_size != RIVER2_ECDH_PUBKEY_SIZE) {
-            ESP_LOGE(TAG, "Device uses an unsupported ECDH curve (curve_type=%u, size=%u)",
+            ESP_LOGE(__func__, "Device uses an unsupported ECDH curve (curve_type=%u, size=%u)",
                      curve_type, (unsigned)dev_pub_size);
             err = ESP_ERR_NOT_SUPPORTED;
             goto done;
         }
         if (reply_len < 3 + dev_pub_size) {
-            ESP_LOGE(TAG, "Public key reply too short: %u bytes, need %u",
+            ESP_LOGE(__func__, "Public key reply too short: %u bytes, need %u",
                      (unsigned)reply_len, (unsigned)(3 + dev_pub_size));
             err = ESP_ERR_INVALID_SIZE;
             goto done;
@@ -325,16 +319,16 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
     river2_ecdh_free(ecdh);
     ecdh = NULL;
 
-    ESP_LOGI(TAG, "ECDH key exchange complete");
+    ESP_LOGI(__func__, "ECDH key exchange complete");
 
     /* --- Step 2: session-key request (protocol doc §3.2) --- */
-    cipher_t session;
+    river2_session_t session;
     memcpy(session.iv, interim.iv, 16); /* final cipher reuses step-1's iv */
     {
         uint8_t payload[1] = {0x02};
         err = send_frame(RIVER2_FRAME_COMMAND, payload, sizeof(payload));
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send session-key request: %s", esp_err_to_name(err));
+            ESP_LOGE(__func__, "Failed to send session-key request: %s", esp_err_to_name(err));
             goto done;
         }
 
@@ -342,11 +336,11 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         size_t reply_len;
         err = wait_for_frame(&fb, RIVER2_FRAME_COMMAND, &reply, &reply_len, STEP_TIMEOUT_MS);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Timed out waiting for session-key reply");
+            ESP_LOGE(__func__, "Timed out waiting for session-key reply");
             goto done;
         }
         if (reply_len < 2 || reply[0] != 0x02) {
-            ESP_LOGE(TAG, "Unexpected session-key reply (type=%u len=%u)",
+            ESP_LOGE(__func__, "Unexpected session-key reply (type=%u len=%u)",
                      reply_len ? reply[0] : 0xFF, (unsigned)reply_len);
             err = ESP_ERR_INVALID_RESPONSE;
             goto done;
@@ -354,13 +348,13 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
 
         uint8_t decrypted[64];
         size_t decrypted_len = 0;
-        err = aes_cbc_decrypt_lenient(&interim, reply + 1, reply_len - 1, decrypted,
+        err = river2_session_decrypt(&interim, reply + 1, reply_len - 1, decrypted,
                                        sizeof(decrypted), &decrypted_len);
         if (err != ESP_OK) {
             goto done;
         }
         if (decrypted_len < 18) {
-            ESP_LOGE(TAG, "Decrypted session-key payload too short: %u bytes",
+            ESP_LOGE(__func__, "Decrypted session-key payload too short: %u bytes",
                      (unsigned)decrypted_len);
             err = ESP_ERR_INVALID_SIZE;
             goto done;
@@ -374,14 +368,14 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         }
     }
 
-    ESP_LOGI(TAG, "Session key derived");
+    ESP_LOGI(__func__, "Session key derived");
 
     /* --- Step 3: auth-status wake-up (protocol doc §3.3) --- */
     {
         err = send_inner_encrypted(&session, RIVER2_ADDR_APP, RIVER2_ADDR_AUTH, 0x35, 0x89,
                                     NULL, 0);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send auth-status wake-up: %s", esp_err_to_name(err));
+            ESP_LOGE(__func__, "Failed to send auth-status wake-up: %s", esp_err_to_name(err));
             goto done;
         }
 
@@ -390,13 +384,13 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
             size_t reply_len;
             err = wait_for_frame(&fb, RIVER2_FRAME_DATA, &reply, &reply_len, STEP_TIMEOUT_MS);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Timed out waiting for auth-status reply");
+                ESP_LOGE(__func__, "Timed out waiting for auth-status reply");
                 goto done;
             }
 
             uint8_t decrypted[256];
             size_t decrypted_len = 0;
-            err = aes_cbc_decrypt_lenient(&session, reply, reply_len, decrypted,
+            err = river2_session_decrypt(&session, reply, reply_len, decrypted,
                                            sizeof(decrypted), &decrypted_len);
             if (err != ESP_OK) {
                 goto done;
@@ -404,18 +398,18 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
 
             river2_inner_packet_t pkt;
             if (!river2_inner_parse(decrypted, decrypted_len, &pkt)) {
-                ESP_LOGW(TAG, "Dropping undecodable frame while awaiting auth-status reply");
+                ESP_LOGW(__func__, "Dropping undecodable frame while awaiting auth-status reply");
                 continue;
             }
             if (pkt.src == RIVER2_ADDR_AUTH && pkt.cmd_set == 0x35) {
                 break;
             }
-            ESP_LOGD(TAG, "Ignoring unrelated packet (src=%#x cmd_set=%#x) during auth-status wait",
+            ESP_LOGD(__func__, "Ignoring unrelated packet (src=%#x cmd_set=%#x) during auth-status wait",
                      pkt.src, pkt.cmd_set);
         }
     }
 
-    ESP_LOGI(TAG, "Auth-status wake-up acknowledged");
+    ESP_LOGI(__func__, "Auth-status wake-up acknowledged");
 
     /* --- Step 4: auto-authentication (protocol doc §3.4-3.5) --- */
     {
@@ -423,7 +417,7 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         size_t serial_len = strlen(dev_serial);
         uint8_t md5_in[USER_ID_SIZE + 20]; /* generous bound for serial_number length */
         if (user_len + serial_len > sizeof(md5_in)) {
-            ESP_LOGE(TAG, "user_id + serial_number too long for auth digest buffer");
+            ESP_LOGE(__func__, "user_id + serial_number too long for auth digest buffer");
             err = ESP_ERR_INVALID_SIZE;
             goto done;
         }
@@ -441,7 +435,7 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
         err = send_inner_encrypted(&session, RIVER2_ADDR_APP, RIVER2_ADDR_AUTH, 0x35, 0x86,
                                     hex_payload, sizeof(hex_payload));
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send auto-authentication: %s", esp_err_to_name(err));
+            ESP_LOGE(__func__, "Failed to send auto-authentication: %s", esp_err_to_name(err));
             goto done;
         }
 
@@ -450,13 +444,13 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
             size_t reply_len;
             err = wait_for_frame(&fb, RIVER2_FRAME_DATA, &reply, &reply_len, STEP_TIMEOUT_MS);
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Timed out waiting for authentication result");
+                ESP_LOGE(__func__, "Timed out waiting for authentication result");
                 goto done;
             }
 
             uint8_t decrypted[256];
             size_t decrypted_len = 0;
-            err = aes_cbc_decrypt_lenient(&session, reply, reply_len, decrypted,
+            err = river2_session_decrypt(&session, reply, reply_len, decrypted,
                                            sizeof(decrypted), &decrypted_len);
             if (err != ESP_OK) {
                 goto done;
@@ -464,7 +458,7 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
 
             river2_inner_packet_t pkt;
             if (!river2_inner_parse(decrypted, decrypted_len, &pkt)) {
-                ESP_LOGW(TAG, "Dropping undecodable frame while awaiting auth result");
+                ESP_LOGW(__func__, "Dropping undecodable frame while awaiting auth result");
                 continue;
             }
 
@@ -473,7 +467,7 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
             if (!is_auth_reply) {
                 /* Any other packet arriving here already implies the device
                  * accepted us (protocol doc §3.5). */
-                ESP_LOGI(TAG, "Authenticated (first data packet received)");
+                ESP_LOGI(__func__, "Authenticated (first data packet received)");
                 err = ESP_OK;
                 break;
             }
@@ -481,10 +475,10 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
             uint8_t code = (pkt.payload_len == 1) ? pkt.payload[0] : 0xFF;
             const char *error_name = auth_error_name(code);
             if (pkt.payload_len == 1 && code == 0x00) {
-                ESP_LOGI(TAG, "Authenticated");
+                ESP_LOGI(__func__, "Authenticated");
                 err = ESP_OK;
             } else {
-                ESP_LOGE(TAG, "Authentication failed: %s (payload=%02x, len=%u)",
+                ESP_LOGE(__func__, "Authentication failed: %s (payload=%02x, len=%u)",
                          error_name ? error_name : "UnknownError", code,
                          (unsigned)pkt.payload_len);
                 err = ESP_ERR_INVALID_STATE;
@@ -494,6 +488,9 @@ esp_err_t river2_auth_run(const ecoflow_config_t *cfg, const char *dev_serial)
     }
 
 done:
+    if (err == ESP_OK) {
+        *out_session = session;
+    }
     river2_ecdh_free(ecdh);
     river2_framebuf_free(&fb);
     return err;

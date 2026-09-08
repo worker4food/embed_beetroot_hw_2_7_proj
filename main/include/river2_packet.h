@@ -11,6 +11,11 @@
 /* Board addresses (protocol doc §4.4). */
 #define RIVER2_ADDR_APP  0x21
 #define RIVER2_ADDR_AUTH 0x35
+#define RIVER2_ADDR_PD   0x02
+
+/* PD heartbeat (protocol doc §5.1): src=RIVER2_ADDR_PD, cmd_set/cmd_id below. */
+#define RIVER2_CMDSET_PD_HEARTBEAT 0x20
+#define RIVER2_CMDID_PD_HEARTBEAT  0x02
 
 /* Builds an inner packet (wire version 2, protocol doc §4.2):
  * prefix/version/len/crc8 header, seq/zero/src/dst/cmd_set/cmd_id, payload, crc16.
