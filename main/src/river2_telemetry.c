@@ -3,19 +3,12 @@
 #include <esp_timer.h>
 
 #include "ble_client.h"
+#include "river2_heartbeat.h"
 #include "river2_packet.h"
 #include "river2_telemetry.h"
 
 #define TELEMETRY_STACK_SIZE 4096
 #define POLL_TIMEOUT_MS 5000
-
-/* PD heartbeat field 6 `soc` (protocol doc §5.1), offset by the preceding
- * fields' widths: model(B,1) + err_code(4s,4) + sys_ver(4s,4) +
- * wifi_ver(4s,4) + wifi_auto_rcvy(B,1). */
-#define PD_SOC_OFFSET 14
-
-#define MPPT_CFG_AC_ENABLED_OFFSET 66
-#define MPPT_CAR_STATE_OFFSET 56
 
 typedef struct {
     river2_session_t session;
@@ -71,8 +64,9 @@ static void telemetry_task(void *arg)
              * DC/AC state notifications are edge-triggered. */
             uint32_t notify_bits = 0;
             if (pkt.src == RIVER2_ADDR_PD && pkt.cmd_set == RIVER2_CMDSET_HEARTBEAT) {
-                if (pkt.payload_len > PD_SOC_OFFSET) {
-                    s_battery_percent = pkt.payload[PD_SOC_OFFSET];
+                const river2_pd_heartbeat_t *pd = (const river2_pd_heartbeat_t *)pkt.payload;
+                if (RIVER2_HEARTBEAT_FIELD_PRESENT(pkt.payload_len, river2_pd_heartbeat_t, soc)) {
+                    s_battery_percent = pd->soc;
                     int64_t now_us = esp_timer_get_time();
                     if (now_us >= next_notify_us) {
                         notify_bits |= RIVER2_TELEMETRY_EVT_BATTERY_LEVEL;
@@ -80,17 +74,16 @@ static void telemetry_task(void *arg)
                     }
                 }
             } else if (pkt.src == RIVER2_ADDR_MPPT && pkt.cmd_set == RIVER2_CMDSET_HEARTBEAT) {
-                if (pkt.payload_len > MPPT_CFG_AC_ENABLED_OFFSET) {
-                    river2_port_state_t ac_enabled =
-                        pkt.payload[MPPT_CFG_AC_ENABLED_OFFSET] ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
+                const river2_mppt_heartbeat_t *mppt = (const river2_mppt_heartbeat_t *)pkt.payload;
+                if (RIVER2_HEARTBEAT_FIELD_PRESENT(pkt.payload_len, river2_mppt_heartbeat_t, cfg_ac_enabled)) {
+                    river2_port_state_t ac_enabled = mppt->cfg_ac_enabled ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
                     if (ac_enabled != s_ac_enabled) {
                         s_ac_enabled = ac_enabled;
                         notify_bits |= RIVER2_TELEMETRY_EVT_AC_STATE;
                     }
                 }
-                if (pkt.payload_len > MPPT_CAR_STATE_OFFSET) {
-                    river2_port_state_t dc_out_state =
-                        pkt.payload[MPPT_CAR_STATE_OFFSET] ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
+                if (RIVER2_HEARTBEAT_FIELD_PRESENT(pkt.payload_len, river2_mppt_heartbeat_t, car_state)) {
+                    river2_port_state_t dc_out_state = mppt->car_state ? RIVER2_PORT_ON : RIVER2_PORT_OFF;
                     if (dc_out_state != s_dc_out_state) {
                         s_dc_out_state = dc_out_state;
                         notify_bits |= RIVER2_TELEMETRY_EVT_DC_STATE;

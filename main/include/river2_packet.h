@@ -12,12 +12,19 @@
 #define RIVER2_ADDR_APP  0x21
 #define RIVER2_ADDR_AUTH 0x35
 #define RIVER2_ADDR_PD   0x02
+#define RIVER2_ADDR_EMS  0x03
+#define RIVER2_ADDR_INV  0x04
 #define RIVER2_ADDR_MPPT 0x05
 
 /* Heartbeat cmd_set/cmd_id (protocol doc §5), shared by the PD (§5.1) and
  * MPPT (§5.5) heartbeats; boards are told apart by `src`. */
 #define RIVER2_CMDSET_HEARTBEAT 0x20
 #define RIVER2_CMDID_HEARTBEAT  0x02
+#define RIVER2_CMDID_BMS_HEARTBEAT 0x32
+
+#define RIVER2_CMDSET_CONTROL 0x20
+#define RIVER2_CMDID_AC_OUTPUT 0x42
+#define RIVER2_CMDID_DC_OUTPUT 0x51
 
 /* Builds an inner packet (wire version 2, protocol doc §4.2):
  * prefix/version/len/crc8 header, seq/zero/src/dst/cmd_set/cmd_id, payload, crc16.
